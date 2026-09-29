@@ -1,0 +1,19 @@
+#!/bin/sh
+#
+# The session: X, and moon as the whole of it.
+#
+# There is no window manager line here because moon is the window manager - `moon desktop`
+# takes the session over itself, and the windows every program opens from then on are put in
+# its frames. See `crates/moon_launcher` and `src/native/application_pane.rs`.
+
+# A screen that blanks in the middle of reading something, on a machine with no power to save.
+xset s off -dpms
+
+# The shells moon opens are login shells of this user, and find Rust and the rest where the
+# provisioning put them.
+export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+
+# What the session said, for when it will not start: `~/.local/state/moon-desktop.log` is the
+# first place to look from another console or over ssh.
+mkdir -p "$HOME/.local/state"
+exec moon desktop "$HOME" >>"$HOME/.local/state/moon-desktop.log" 2>&1

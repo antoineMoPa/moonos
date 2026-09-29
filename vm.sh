@@ -8,6 +8,7 @@
 #   ./vm.sh ssh [...]  a shell in it, or one command - once its user has trusted your key
 #   ./vm.sh address    where it is on the network
 #   ./vm.sh shot FILE  what its screen shows right now, as a PNG
+#   ./vm.sh snapshot NAME | restore NAME | snapshots
 #   ./vm.sh delete
 #
 # The machine has no display of its own to look at while it installs: `shot` is how the install
@@ -45,7 +46,16 @@ amd64   amd64 Debian13_64
 # VirtualBox writes this line itself, and passing any of it replaces all of it, so what it
 # would have written is spelled out here. Anything after `--` is for the installed system
 # rather than the installer, so ours goes before it.
-INSTALL_KERNEL_PARAMETERS="auto=true preseed/file=/cdrom/preseed.cfg priority=critical quiet splash noprompt noshell automatic-ubiquity debian-installer/locale=en_US keyboard-configuration/layoutcode=us languagechooser/language-name=English localechooser/supported-locales=en_US.UTF-8 countrychooser/shortlist=US debian-installer/exit/poweroff=true --"
+# `priority=critical` only filters which QUESTIONS are shown by their importance - it does not
+# stop d-i from blocking on one. A post-install command that fails is always asked about at
+# critical priority, however this is set, and the installer sits at a red screen waiting for a
+# key that is never coming: `debconf/frontend=noninteractive` is the setting that answers such
+# a question with its default instead of asking, which is what makes a failure survivable
+# rather than a hang.
+INSTALL_KERNEL_PARAMETERS="auto=true preseed/file=/cdrom/preseed.cfg priority=critical debconf/frontend=noninteractive quiet splash noprompt noshell automatic-ubiquity debian-installer/locale=en_US keyboard-configuration/layoutcode=us languagechooser/language-name=English localechooser/supported-locales=en_US.UTF-8 countrychooser/shortlist=US debian-installer/exit/poweroff=true --"
+
+# Where moon itself is checked out; the machine is built from it. `push.sh` says the same.
+MOON_SOURCE="${MOON_SOURCE:-$(cd "$HERE/.." && pwd)/moon-dev-tools}"
 
 ARCH="${MOONOS_ARCH:-$(uname -m)}"
 DEBIAN_ARCH="$(awk -v arch="$ARCH" '$1 == arch { print $2; exit }' <<<"$ARCHITECTURES")"
@@ -136,7 +146,8 @@ create() {
     VBoxManage storageattach "$VM" --storagectl VirtioSCSI --port 1 --device 0 \
         --type dvddrive --medium "$ISO"
 
-    say "installing Debian, unattended"
+    serve_the_repos
+    say "installing Debian and building the desktop into it, unattended"
     VBoxManage unattended install "$VM" \
         --iso="$ISO" \
         --user="$USER_NAME" --user-password="$USER_PASSWORD" \
@@ -146,18 +157,73 @@ create() {
         --locale=en_US --country=US --time-zone=UTC \
         --package-selection-adjustment=minimal \
         --extra-install-kernel-parameters="$INSTALL_KERNEL_PARAMETERS" \
+        --post-install-command="sh -c 'wget -q -O /tmp/bootstrap.sh $BOOTSTRAP_FROM/bootstrap.sh && sh /tmp/bootstrap.sh $BOOTSTRAP_FROM $USER_NAME'" \
         --start-vm=headless
 
     await_install
+}
+
+# This repo and moon's source, offered to the machine being installed and to nobody else for
+# any longer than that.
+#
+# The machine has no way in - no key is trusted and nothing is typed at it - so what it is built
+# from has to be something it fetches. It is on the same network as this host, so this host
+# hands it the two repos over HTTP while the install runs, and stops the moment it is done.
+serve_the_repos() {
+    local from="$CACHE/bootstrap"
+    rm -rf "$from"
+    mkdir -p "$from"
+    cp "$HERE/bootstrap.sh" "$from/"
+
+    say "packing this repo and moon's source for the machine to fetch"
+    tar -cz -C "$HERE" --exclude .git --exclude .cache -f "$from/moonos.tar.gz" .
+    tar -cz -C "$MOON_SOURCE" --exclude .git --exclude target -f "$from/moon-dev-tools.tar.gz" .
+
+    # Nothing else may be on that port: a server already there would answer the machine with
+    # whatever it happens to be serving, and the machine would fetch the wrong thing and fail
+    # somewhere far from here. Which is what a leftover `python3 -m http.server` did once.
+    if curl -s --max-time 2 -o /dev/null "http://127.0.0.1:$BOOTSTRAP_PORT/"; then
+        echo "something is already serving on port $BOOTSTRAP_PORT - stop it, or set" >&2
+        echo "MOONOS_BOOTSTRAP_PORT to a free one" >&2
+        exit 1
+    fi
+
+    python3 -m http.server "$BOOTSTRAP_PORT" --directory "$from" --bind 0.0.0.0 >/dev/null 2>&1 &
+    BOOTSTRAP_SERVER=$!
+
+    # And it has to actually be up, serving what this machine will ask for.
+    sleep 1
+    if ! curl -s --max-time 3 -o /dev/null "http://127.0.0.1:$BOOTSTRAP_PORT/moonos.tar.gz"; then
+        echo "the repos are not being served on port $BOOTSTRAP_PORT" >&2
+        exit 1
+    fi
+    trap 'kill "$BOOTSTRAP_SERVER" 2>/dev/null || true' EXIT
+
+    BOOTSTRAP_FROM="http://$(host_address):$BOOTSTRAP_PORT"
+    say "serving them at $BOOTSTRAP_FROM"
+}
+
+# This host's own address on the network the machine is bridged onto.
+host_address() {
+    if command -v ipconfig >/dev/null 2>&1; then
+        ipconfig getifaddr "$BRIDGE_TO"                               # macOS
+    else
+        ip -4 -o addr show "$BRIDGE_TO" | awk '{ sub(/\/.*/, "", $4); print $4; exit }'
+    fi
 }
 
 # How much has to be on the disk before a machine counts as installed. A Debian with nothing
 # chosen is well over a gigabyte; an empty disk is a rounding error.
 INSTALLED_AT_LEAST_MB=500
 
-# How long an install is given before it is called stuck. It takes about five minutes, so this
-# is a long way past wrong rather than a guess at right.
-INSTALL_PATIENCE=$((20 * 60))
+
+# How long an install is given before it is called stuck. Debian itself takes five minutes;
+# the rest is moon being compiled on the machine while the installer waits - see bootstrap.sh.
+INSTALL_PATIENCE=$((75 * 60))
+
+# The port this repo and moon's source are served on while a machine is being installed, for
+# that machine alone to fetch them from.
+BOOTSTRAP_PORT="${MOONOS_BOOTSTRAP_PORT:-8099}"
 
 # Wait for the install, and say which way it went.
 #
@@ -199,7 +265,38 @@ await_install() {
         echo "what its screen last showed: $shot" >&2
         return 1
     fi
-    say "installed in $(((SECONDS - began) / 60))m, ${written}MB on disk - ./vm.sh start"
+
+    # A Debian on the disk is not what was asked for, and disk size cannot tell them apart:
+    # rustup and Zig alone put several gigabytes down before the build itself has compiled a
+    # line, so a machine that died partway through the toolchain looks the same by size as one
+    # with a finished desktop. There is no ssh to ask it directly either - so the only honest
+    # answer left is to look. This boots it and takes a picture rather than guessing.
+    say "installed in $(((SECONDS - began) / 60))m, ${written}MB on disk"
+
+    # Whatever this is - a finished desktop or a build that died partway - it took thirty-odd
+    # minutes to reach, almost all of it compiling moon from nothing. Snapshotting it here,
+    # before it is even booted to look at, means that time is never spent twice: a later fix
+    # restores this rather than installing again, and only what changed has to rebuild.
+    local checkpoint="installed-$(date +%Y%m%d-%H%M%S)"
+    if VBoxManage snapshot "$VM" take "$checkpoint" --description "moonos: right after the installer finished" >/dev/null 2>&1; then
+        echo "  saved as the snapshot '$checkpoint' - restore it instead of installing again"
+    fi
+
+    say "checking what it boots to"
+    VBoxManage startvm "$VM" --type headless >/dev/null
+    local settle=45
+    while [ "$settle" -gt 0 ] && running; do
+        sleep 5
+        settle=$((settle - 5))
+    done
+    VBoxManage controlvm "$VM" screenshotpng "$shot" >/dev/null 2>&1 || true
+    cat <<EOF
+$VM: $shot
+
+A login prompt there means the build failed partway - its log is
+/var/log/vboxpostinstall.log on the machine, readable by logging in as root. Anything
+else - a shell, moon's own tab strip - means it is the desktop: ./vm.sh start
+EOF
 }
 
 start() {
@@ -245,15 +342,19 @@ stop() {
     echo "$VM is off"
 }
 
-# How much of the machine's disk has actually been written, in megabytes. The file grows as
-# the disk fills: a VDI is only as big as what is in it.
+# How much has actually been written to the machine, in megabytes. A VDI is only as big as
+# what is in it, so this grows as the disk fills.
+#
+# The whole folder rather than the disk file: once a machine has a snapshot, its writes go to a
+# differencing disk beside the original, which then never changes size again - and a check that
+# reads only the original would see a machine that has been busy for an hour as untouched.
 disk_written_mb() {
-    local disk="$HOME/VirtualBox VMs/$VM/$VM.vdi"
-    if [ ! -f "$disk" ]; then
+    local folder="$HOME/VirtualBox VMs/$VM"
+    if [ ! -d "$folder" ]; then
         echo 0
         return
     fi
-    echo $(( $(du -k "$disk" | cut -f1) / 1024 ))
+    du -sm "$folder" | cut -f1
 }
 
 # What VirtualBox says the machine is doing, and whether that is running.
@@ -264,6 +365,36 @@ state() {
 
 running() {
     [ "$(state)" = "running" ]
+}
+
+# Snapshots, for getting back to a machine in a known state without installing one again: a
+# Debian install is minutes and a build of moon is half an hour, and most of what goes wrong
+# here wants trying again from the same place.
+snapshot() {
+    local name="${1:?a name for the snapshot}"
+    # Off first: a snapshot of a running machine has to write its memory out as well, which for
+    # a machine with this much of it takes longer than the install it is meant to save.
+    if running; then
+        stop >/dev/null
+    fi
+    VBoxManage snapshot "$VM" take "$name" --description "moonos $name"
+    echo "$VM: snapshot $name"
+}
+
+restore() {
+    local name="${1:?which snapshot to go back to}"
+    if running; then
+        VBoxManage controlvm "$VM" poweroff >/dev/null
+        while running; do sleep 1; done
+    fi
+    VBoxManage snapshot "$VM" restore "$name"
+    echo "$VM: back at $name"
+}
+
+snapshots() {
+    VBoxManage snapshot "$VM" list --machinereadable 2>/dev/null \
+        | sed -n 's/^SnapshotName[^=]*="\(.*\)"/  \1/p' \
+        || echo "  none"
 }
 
 shot() {
@@ -340,7 +471,9 @@ somebody inside it says so. At its console, logged in as $USER_NAME:
 
 Then this, and \`push.sh\`, reach it.
 EOF
-        exit 1
+        # `return`, not `exit`: this is asked as a question by `stop` and by `push.sh`, and an
+        # `exit` in a function is the end of the whole script however politely it was asked.
+        return 1
     fi
     ssh -i "$SSH_KEY" \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
@@ -364,6 +497,9 @@ case "${1:-}" in
     start) start ;;
     stop) stop ;;
     shot) shift; shot "$@" ;;
+    snapshot) shift; snapshot "$@" ;;
+    restore) shift; restore "$@" ;;
+    snapshots) snapshots ;;
     ssh) shift; ssh_in "$@" ;;
     delete) delete ;;
     key) need_key; echo "$SSH_KEY" ;;

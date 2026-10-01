@@ -10,12 +10,16 @@
 # Everything it does is idempotent: it is run again after every change to moon, and only the
 # build takes any time.
 #
-#   provision.sh packages     what the desktop and the build need, from Debian
+#   provision.sh packages     what the desktop needs, from Debian
 #   provision.sh applications what there is to start, and the extension that lists it
-#   provision.sh toolchain    Rust and Zig, which moon is built with
-#   provision.sh build        build moon out of ~/moon-dev-tools and install it
+#   provision.sh release      install the moon that is published, already built
 #   provision.sh session      boot into moon: autologin on tty1, and X starting the desktop
-#   provision.sh all          all of the above, in that order
+#   provision.sh all          the four above, in that order - a desktop, with nothing compiled
+#
+# And for working on moon itself, which a desktop does not need:
+#
+#   provision.sh toolchain    Rust, Zig and the headers moon is built against
+#   provision.sh build        build moon out of ~/moon-dev-tools and install it over the release
 
 set -euo pipefail
 
@@ -40,10 +44,16 @@ ZIG_VERSION=0.15.2
 # nothing here to keep in step with anything.
 ZIG_HOME="/opt/zig-$(uname -m)-linux-$ZIG_VERSION"
 
+# Where moon's releases are published, and what the one for this machine is called there: a
+# Rust target triple, whose architecture is in the same words `uname -m` uses. `latest` is
+# whichever release was published last - the same one moon's own install.sh fetches.
+RELEASES="${MOON_RELEASES:-https://github.com/antoineMoPa/moon-dev-tools/releases/latest/download}"
+RELEASE_ARCHIVE="moonreview-$(uname -m)-unknown-linux-gnu.tar.gz"
+
 say() { printf '\n=== %s\n' "$*"; }
 
 packages() {
-    say "what the desktop and the build need"
+    say "what the desktop needs"
     $SUDO apt-get update
     # Xorg and no desktop environment: moon is the desktop environment - see `moon desktop`.
     #
@@ -55,11 +65,28 @@ packages() {
         xserver-xorg xserver-xorg-input-libinput xinit mesa-utils \
         x11-xserver-utils libgl1 libegl1 libglx-mesa0 libgl1-mesa-dri \
         fonts-dejavu-core fonts-noto-color-emoji \
-        ca-certificates curl git xz-utils pkg-config build-essential cmake \
-        xdotool \
-        libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev \
-        libwayland-dev libfontconfig1-dev libssl-dev \
+        ca-certificates curl git \
+        libx11-6 libx11-xcb1 libxcursor1 libxrandr2 libxi6 \
+        libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 \
         x11-apps xterm xdotool
+    # The libraries on the fourth line are moon's own: the released executable is linked
+    # against libc alone and opens the X ones by name when its window starts, so nothing pulls
+    # them in for it and a missing one is a desktop that dies at startup.
+}
+
+# The moon that is published, rather than one compiled here. Compiling it is half an hour of
+# Rust and Zig on a machine that is being installed; this is one download.
+release() {
+    say "installing the released moon"
+    local fetched
+    fetched="$(mktemp -d)"
+    curl -fsSL --retry 3 -o "$fetched/$RELEASE_ARCHIVE" "$RELEASES/$RELEASE_ARCHIVE"
+    curl -fsSL --retry 3 -o "$fetched/$RELEASE_ARCHIVE.sha256" "$RELEASES/$RELEASE_ARCHIVE.sha256"
+    (cd "$fetched" && sha256sum -c "$RELEASE_ARCHIVE.sha256")
+    tar -xzf "$fetched/$RELEASE_ARCHIVE" -C "$fetched"
+    $SUDO install -m 0755 "$fetched/moon" /usr/local/bin/moon
+    rm -rf "$fetched"
+    moon --version
 }
 
 # What there is to start from the palette, which is also what the `applications` extension
@@ -93,14 +120,23 @@ EOF
 
     # The extension that lists them, into the folder moon offers a person's own extensions
     # from - see Extensions.md in moon for how the folder works.
-    install -d -o "$MOON_USER" -g "$MOON_USER" "$MOON_HOME/.moonreview/extensions"
+    #
+    # Both folders by name: `install -d` gives the owner asked for to the last one only and
+    # leaves the ones it makes on the way there to whoever is running it - root, in the
+    # installer - and a ~/.moonreview that is root's is one moon cannot save its settings in.
+    install -d -o "$MOON_USER" -g "$MOON_USER" \
+        "$MOON_HOME/.moonreview" "$MOON_HOME/.moonreview/extensions"
     install -o "$MOON_USER" -g "$MOON_USER" -m 0644 \
         "$MOONOS/extensions/applications.rhai" "$MOON_HOME/.moonreview/extensions/"
     echo "applications.rhai -> ~/.moonreview/extensions/"
 }
 
 toolchain() {
-    say "Rust and Zig"
+    say "Rust, Zig and what moon is built against"
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        xz-utils pkg-config build-essential cmake \
+        libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev \
+        libwayland-dev libfontconfig1-dev libssl-dev
     if ! [ -x "$HOME/.cargo/bin/cargo" ]; then
         curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
     fi
@@ -120,6 +156,10 @@ toolchain() {
 }
 
 build() {
+    # A machine made by `all` has never had the toolchain: the first build brings it.
+    if ! [ -x "$HOME/.cargo/bin/cargo" ] || ! [ -x "$ZIG_HOME/zig" ]; then
+        toolchain
+    fi
     say "building moon"
     # shellcheck disable=SC1091
     . "$HOME/.cargo/env"
@@ -171,18 +211,18 @@ EOF
 case "${1:-all}" in
     packages) packages ;;
     applications) applications ;;
+    release) release ;;
     toolchain) toolchain ;;
     build) build ;;
     session) session ;;
     all)
         packages
         applications
-        toolchain
-        build
+        release
         session
         ;;
     *)
-        echo "provision.sh [packages|applications|toolchain|build|session|all]" >&2
+        echo "provision.sh [packages|applications|release|session|all|toolchain|build]" >&2
         exit 2
         ;;
 esac

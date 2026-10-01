@@ -54,9 +54,6 @@ amd64   amd64 Debian13_64
 # rather than a hang.
 INSTALL_KERNEL_PARAMETERS="auto=true preseed/file=/cdrom/preseed.cfg priority=critical debconf/frontend=noninteractive quiet splash noprompt noshell automatic-ubiquity debian-installer/locale=en_US keyboard-configuration/layoutcode=us languagechooser/language-name=English localechooser/supported-locales=en_US.UTF-8 countrychooser/shortlist=US debian-installer/exit/poweroff=true --"
 
-# Where moon itself is checked out; the machine is built from it. `push.sh` says the same.
-MOON_SOURCE="${MOON_SOURCE:-$(cd "$HERE/.." && pwd)/moon-dev-tools}"
-
 ARCH="${MOONOS_ARCH:-$(uname -m)}"
 DEBIAN_ARCH="$(awk -v arch="$ARCH" '$1 == arch { print $2; exit }' <<<"$ARCHITECTURES")"
 GUEST_TYPE="$(awk -v arch="$ARCH" '$1 == arch { print $3; exit }' <<<"$ARCHITECTURES")"
@@ -69,8 +66,9 @@ fi
 ISO="$CACHE/debian-$ISO_VERSION-$DEBIAN_ARCH-netinst.iso"
 ISO_URL="https://cdimage.debian.org/debian-cd/current/$DEBIAN_ARCH/iso-cd/debian-$ISO_VERSION-$DEBIAN_ARCH-netinst.iso"
 
-# The machine builds moon from source - a Rust workspace with Ghostty's VT engine under it - so
-# it is given the cores and the memory of a build machine, not of a desktop.
+# The machine is installed with the released moon, but `push.sh` builds moon from source on it
+# - a Rust workspace with Ghostty's VT engine under it - so it is given the cores and the memory
+# of a build machine, not of a desktop.
 MEMORY_MB=8192
 CPUS=6
 DISK_MB=40960
@@ -120,11 +118,17 @@ create() {
     VBoxManage createvm --name "$VM" --ostype "$GUEST_TYPE" --register
     # Bridged puts the machine on the same network as the host, where it gets its own address -
     # which is also how ssh reaches it. `./vm.sh ssh` finds that address by the card's MAC.
+    #
+    # The card is an emulated Intel one (e1000), which is also what VirtualBox itself picks for
+    # an ARM Debian. Not virtio: VirtualBox's virtio-net on ARM wedges under load - the guest
+    # logs "NETDEV WATCHDOG: transmit queue 0 timed out" and never sends another packet - and
+    # twenty minutes into an install that still compiled moon it did exactly that, the next
+    # download failed, and the install ended at a red "Failed to run preseeded command" screen.
     VBoxManage modifyvm "$VM" \
         --memory "$MEMORY_MB" --cpus "$CPUS" --vram "$VRAM_MB" \
         --firmware efi --graphicscontroller vmsvga --audio-driver none \
         --usb-xhci on --keyboard usb --mouse usbtablet \
-        --nic1 bridged --bridge-adapter1 "$BRIDGE_TO" --nic-type1 virtio --cableconnected1 on
+        --nic1 bridged --bridge-adapter1 "$BRIDGE_TO" --nic-type1 82540EM --cableconnected1 on
     # USB keyboard and a USB tablet for the pointer. VirtualBox gives a new machine a PS/2
     # keyboard and a PS/2 mouse, and an ARM machine has no PS/2 at all: nothing typed at the
     # window reaches the guest, and `VBoxManage controlvm keyboardputscancode` answers "failed
@@ -146,8 +150,8 @@ create() {
     VBoxManage storageattach "$VM" --storagectl VirtioSCSI --port 1 --device 0 \
         --type dvddrive --medium "$ISO"
 
-    serve_the_repos
-    say "installing Debian and building the desktop into it, unattended"
+    serve_this_repo
+    say "installing Debian and making it the desktop, unattended"
     VBoxManage unattended install "$VM" \
         --iso="$ISO" \
         --user="$USER_NAME" --user-password="$USER_PASSWORD" \
@@ -163,21 +167,20 @@ create() {
     await_install
 }
 
-# This repo and moon's source, offered to the machine being installed and to nobody else for
-# any longer than that.
+# This repo, offered to the machine being installed and to nobody else for any longer than that.
 #
-# The machine has no way in - no key is trusted and nothing is typed at it - so what it is built
-# from has to be something it fetches. It is on the same network as this host, so this host
-# hands it the two repos over HTTP while the install runs, and stops the moment it is done.
-serve_the_repos() {
+# The machine has no way in - no key is trusted and nothing is typed at it - so what provisions
+# it has to be something it fetches. It is on the same network as this host, so this host hands
+# it this repo over HTTP while the install runs, and stops the moment it is done. moon itself it
+# fetches from where moon's releases are published - see `release` in provision.sh.
+serve_this_repo() {
     local from="$CACHE/bootstrap"
     rm -rf "$from"
     mkdir -p "$from"
     cp "$HERE/bootstrap.sh" "$from/"
 
-    say "packing this repo and moon's source for the machine to fetch"
+    say "packing this repo for the machine to fetch"
     tar -cz -C "$HERE" --exclude .git --exclude .cache -f "$from/moonos.tar.gz" .
-    tar -cz -C "$MOON_SOURCE" --exclude .git --exclude target -f "$from/moon-dev-tools.tar.gz" .
 
     # Nothing else may be on that port: a server already there would answer the machine with
     # whatever it happens to be serving, and the machine would fetch the wrong thing and fail
@@ -194,13 +197,13 @@ serve_the_repos() {
     # And it has to actually be up, serving what this machine will ask for.
     sleep 1
     if ! curl -s --max-time 3 -o /dev/null "http://127.0.0.1:$BOOTSTRAP_PORT/moonos.tar.gz"; then
-        echo "the repos are not being served on port $BOOTSTRAP_PORT" >&2
+        echo "this repo is not being served on port $BOOTSTRAP_PORT" >&2
         exit 1
     fi
     trap 'kill "$BOOTSTRAP_SERVER" 2>/dev/null || true' EXIT
 
     BOOTSTRAP_FROM="http://$(host_address):$BOOTSTRAP_PORT"
-    say "serving them at $BOOTSTRAP_FROM"
+    say "serving it at $BOOTSTRAP_FROM"
 }
 
 # This host's own address on the network the machine is bridged onto.
@@ -218,11 +221,12 @@ INSTALLED_AT_LEAST_MB=500
 
 
 # How long an install is given before it is called stuck. Debian itself takes five minutes;
-# the rest is moon being compiled on the machine while the installer waits - see bootstrap.sh.
-INSTALL_PATIENCE=$((75 * 60))
+# the rest is the desktop's packages - Xorg, chromium - and the released moon being downloaded
+# while the installer waits - see bootstrap.sh.
+INSTALL_PATIENCE=$((30 * 60))
 
-# The port this repo and moon's source are served on while a machine is being installed, for
-# that machine alone to fetch them from.
+# The port this repo is served on while a machine is being installed, for that machine alone to
+# fetch it from.
 BOOTSTRAP_PORT="${MOONOS_BOOTSTRAP_PORT:-8099}"
 
 # Wait for the install, and say which way it went.
@@ -267,16 +271,14 @@ await_install() {
     fi
 
     # A Debian on the disk is not what was asked for, and disk size cannot tell them apart:
-    # rustup and Zig alone put several gigabytes down before the build itself has compiled a
-    # line, so a machine that died partway through the toolchain looks the same by size as one
-    # with a finished desktop. There is no ssh to ask it directly either - so the only honest
-    # answer left is to look. This boots it and takes a picture rather than guessing.
+    # a machine whose provisioning died partway through its packages looks the same by size as
+    # one with a finished desktop. There is no ssh to ask it directly either - so the only
+    # honest answer left is to look. This boots it and takes a picture rather than guessing.
     say "installed in $(((SECONDS - began) / 60))m, ${written}MB on disk"
 
-    # Whatever this is - a finished desktop or a build that died partway - it took thirty-odd
-    # minutes to reach, almost all of it compiling moon from nothing. Snapshotting it here,
-    # before it is even booted to look at, means that time is never spent twice: a later fix
-    # restores this rather than installing again, and only what changed has to rebuild.
+    # Whatever this is - a finished desktop or a provisioning that died partway - snapshotting
+    # it here, before it is even booted to look at, means the install is never spent twice: a
+    # later fix restores this rather than installing again.
     local checkpoint="installed-$(date +%Y%m%d-%H%M%S)"
     if VBoxManage snapshot "$VM" take "$checkpoint" --description "moonos: right after the installer finished" >/dev/null 2>&1; then
         echo "  saved as the snapshot '$checkpoint' - restore it instead of installing again"
@@ -293,7 +295,7 @@ await_install() {
     cat <<EOF
 $VM: $shot
 
-A login prompt there means the build failed partway - its log is
+A login prompt there means the provisioning failed partway - its log is
 /var/log/vboxpostinstall.log on the machine, readable by logging in as root. Anything
 else - a shell, moon's own tab strip - means it is the desktop: ./vm.sh start
 EOF

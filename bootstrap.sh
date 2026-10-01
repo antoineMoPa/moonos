@@ -4,17 +4,17 @@
 # still running - so the first time the machine boots for itself, it boots into moon.
 #
 # `vm.sh create` hands this to VirtualBox as the command to run at the end of the install, and
-# serves this repo and moon's source over HTTP for the length of it. This runs inside the
+# serves this repo over HTTP for the length of it. This runs inside the
 # installer, as root, outside the chroot, with the new system mounted at /target.
 #
 #   bootstrap.sh <where the host is serving from> [<user>]
 #
-# Everything it says goes to the installer's console as well as its log, because a build that
-# goes wrong here is a machine with no desktop and no way in to ask why.
+# Everything it says goes to the installer's console as well as its log, because a provisioning
+# that goes wrong here is a machine with no desktop and no way in to ask why.
 
 set -eu
 
-FROM="${1:?the address this machine can fetch the repos from}"
+FROM="${1:?the address this machine can fetch this repo from}"
 MOON_USER="${2:-moon}"
 TARGET=/target
 
@@ -26,15 +26,14 @@ in_target() {
     chroot "$TARGET" "$@"
 }
 
-say "fetching moon and moonos from $FROM"
-for repo in moon-dev-tools moonos; do
-    mkdir -p "$TARGET/home/$MOON_USER/$repo"
-    wget -q -O - "$FROM/$repo.tar.gz" \
-        | tar -xz -C "$TARGET/home/$MOON_USER/$repo"
-done
+# moon itself is not fetched from the host: the provisioning installs the published release.
+say "fetching moonos from $FROM"
+mkdir -p "$TARGET/home/$MOON_USER/moonos"
+wget -q -O - "$FROM/moonos.tar.gz" \
+    | tar -xz -C "$TARGET/home/$MOON_USER/moonos"
 in_target chown -R "$MOON_USER:$MOON_USER" "/home/$MOON_USER"
 
-# The build wants a network it can reach: the installer's resolver is what the installed system
+# The provisioning wants a network it can reach: the installer's resolver is what the installed system
 # will use anyway.
 cp /etc/resolv.conf "$TARGET/etc/resolv.conf" 2>/dev/null || true
 
@@ -52,20 +51,19 @@ sed -i 's|^deb cdrom:|# deb cdrom:|' "$TARGET/etc/apt/sources.list"
 echo "deb http://deb.debian.org/debian trixie main" \
     > "$TARGET/etc/apt/sources.list.d/moonos-bootstrap.list"
 
-say "building the desktop - this is the long part, about half an hour"
+say "making it a desktop - packages from Debian and the released moon, a few minutes"
 
 # Through `tee` so that it can be watched on the console, and the status written down on the
 # way past: a pipeline answers with what its last command did, so `tee` succeeding would
-# otherwise make a build that failed look like one that worked - which is exactly what it did.
+# otherwise make a provisioning that failed look like one that worked - which is exactly what it did.
 # `env` without `-i` keeps whatever PATH the process calling it had - which here is the live
 # installer's, not the target filesystem's, and chrooting does not change that. The installer's
-# PATH has no /usr/local/bin, so a plain `zig` - put there by this same provisioning, a moment
+# PATH has no /usr/local/bin, so a plain `moon` - put there by this same provisioning, a moment
 # earlier - is not found by the very next line that asks for it. Spelling PATH out is the fix;
 # it is also then the same PATH a real login shell on the finished machine would have.
 in_target env \
     PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     MOON_USER="$MOON_USER" \
-    MOON_SOURCE_DIR="/home/$MOON_USER/moon-dev-tools" \
     MOONOS_DIR="/home/$MOON_USER/moonos" \
     HOME=/root \
     sh -c "sh /home/$MOON_USER/moonos/provision.sh all 2>&1; echo \$? > /moonos-built" \
@@ -74,7 +72,7 @@ in_target env \
 built="$(cat "$TARGET/moonos-built" 2>/dev/null || echo 1)"
 rm -f "$TARGET/moonos-built"
 if [ "$built" != 0 ]; then
-    say "the build failed ($built) - this machine is a Debian, not a desktop"
+    say "the provisioning failed ($built) - this machine is a Debian, not a desktop"
     exit "$built"
 fi
 
